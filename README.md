@@ -1,0 +1,2 @@
+# ccinspector
+Claude Code Inspector
