@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Outer hexagon frame -->
+  <path d="M32 4L56.8 18v28L32 60 7.2 46V18L32 4z" stroke="#00d4aa" stroke-width="2" fill="#0d1117" opacity="0.9"/>
+  <!-- Inner circuit ring -->
+  <circle cx="32" cy="32" r="16" stroke="#00d4aa" stroke-width="1.5" opacity="0.4"/>
+  <!-- Scan lines -->
+  <line x1="20" y1="26" x2="44" y2="26" stroke="#00d4aa" stroke-width="1" opacity="0.3"/>
+  <line x1="18" y1="32" x2="46" y2="32" stroke="#00d4aa" stroke-width="1" opacity="0.3"/>
+  <line x1="20" y1="38" x2="44" y2="38" stroke="#00d4aa" stroke-width="1" opacity="0.3"/>
+  <!-- Code brackets < > -->
+  <path d="M24 24l-6 8 6 8" stroke="#00d4aa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M40 24l6 8-6 8" stroke="#00d4aa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Center dot - inspection focus -->
+  <circle cx="32" cy="32" r="2.5" fill="#00d4aa"/>
+  <!-- Corner nodes -->
+  <circle cx="32" cy="4" r="2" fill="#00d4aa" opacity="0.6"/>
+  <circle cx="56.8" cy="18" r="2" fill="#00d4aa" opacity="0.6"/>
+  <circle cx="56.8" cy="46" r="2" fill="#00d4aa" opacity="0.6"/>
+  <circle cx="32" cy="60" r="2" fill="#00d4aa" opacity="0.6"/>
+  <circle cx="7.2" cy="46" r="2" fill="#00d4aa" opacity="0.6"/>
+  <circle cx="7.2" cy="18" r="2" fill="#00d4aa" opacity="0.6"/>
+</svg>
