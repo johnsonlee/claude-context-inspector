@@ -1,22 +1,26 @@
 {
-  "name": "claude-context-dashboard",
+  "name": "claude-context-inspector",
   "version": "1.0.0",
   "description": "Web UI for visualizing Claude Code context window usage, cost tracking, and session comparison",
-  "main": "server/index.ts",
   "type": "module",
+  "bin": {
+    "ccinspector": "bin/ccinspector.js",
+    "claude-context-inspector": "bin/ccinspector.js"
+  },
+  "files": [
+    "dist/",
+    "dist-server/",
+    "bin/"
+  ],
   "scripts": {
     "dev": "tsx --watch server/index.ts & vite",
     "dev:server": "tsx --watch server/index.ts",
     "dev:client": "vite",
     "build": "vite build",
-    "start": "tsx server/index.ts",
-    "preview": "vite build && tsx server/index.ts"
-  },
-  "dependencies": {
-    "chokidar": "^4.0.0",
-    "express": "^4.21.0",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4"
+    "build:server": "esbuild server/index.ts --bundle --platform=node --format=esm --outfile=dist-server/index.js --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\"",
+    "start": "node dist-server/index.js",
+    "preview": "vite build && tsx server/index.ts",
+    "prepublishOnly": "npm run build && npm run build:server"
   },
   "engines": {
     "node": ">=18"
@@ -27,6 +31,11 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.4",
+    "chokidar": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "express": "^4.21.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vite": "^7.3.1"
