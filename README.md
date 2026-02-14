@@ -27,18 +27,22 @@ Each line contains a typed message (`user`, `assistant`, `system`, `summary`) wi
 - `tool_result` — output from tool execution
 - `summary` — compaction summary preserving session state
 
-## Quick Start
+## Install
 
 ```bash
-cd ccinspector
-npm install
-npm start
+npm i -g claude-context-inspector
+ccinspector
 # → http://localhost:3456
 ```
 
-For development with auto-reload:
+## Development
+
 ```bash
+git clone https://github.com/johnsonlee/claude-context-inspector.git
+cd claude-context-inspector
+npm install
 npm run dev
+# → http://localhost:5173 (proxies API to :3456)
 ```
 
 ## Configuration
