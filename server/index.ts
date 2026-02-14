@@ -1154,9 +1154,21 @@ if (existsSync(PROJECTS_DIR)) {
 
 app.get('*', (_req: Request, res: Response) => { res.sendFile(join(__dirname, '..', 'dist', 'index.html')); });
 
-app.listen(PORT, () => {
+const PID_FILE = join(CACHE_DIR, 'daemon.pid');
+
+app.listen(PORT, async () => {
   console.log(`\n  🔍 Claude Context Inspector`);
   console.log(`  → http://localhost:${PORT}`);
   console.log(`  → Reading from: ${PROJECTS_DIR}`);
   console.log(`  → Live-reload: enabled\n`);
+
+  if (process.env.DAEMON === '1') {
+    await mkdir(CACHE_DIR, { recursive: true });
+    await writeFile(PID_FILE, String(process.pid), 'utf-8');
+  }
+});
+
+process.on('SIGTERM', async () => {
+  try { await unlink(PID_FILE); } catch { /* ignore */ }
+  process.exit(0);
 });
