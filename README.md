@@ -27,12 +27,18 @@ Each line contains a typed message (`user`, `assistant`, `system`, `summary`) wi
 - `tool_result` — output from tool execution
 - `summary` — compaction summary preserving session state
 
-## Install
+## Quick Start
+
+```bash
+npx claude-context-inspector
+# → http://localhost:3456
+```
+
+Or install globally:
 
 ```bash
 npm i -g claude-context-inspector
 ccinspector
-# → http://localhost:3456
 ```
 
 ## Daemon Mode
