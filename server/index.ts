@@ -1,7 +1,7 @@
 import express, { type Request, type Response } from 'express';
-import { readdir, readFile, stat, rm, unlink } from 'fs/promises';
+import { readdir, readFile, stat, rm, unlink, mkdir, writeFile, rename } from 'fs/promises';
 import { join } from 'path';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -572,7 +572,13 @@ app.get('/api/projects', async (_req: Request, res: Response) => {
       const isActive = isProjectActive(e.name);
       const allProjectFiles = await findJsonlFiles(projectDir);
       const projectUsage = await aggregateUsage(allProjectFiles, 'all');
-      const costUSD = projectUsage.totalCostUSD;
+      let costUSD = projectUsage.totalCostUSD;
+      // Add cached cost from deleted sessions
+      const liveFileNames = new Set(allProjectFiles.map(f => f.replace('.jsonl', '').split('/').pop()!));
+      const cachedSessions = getCachedUsageForProject(e.name);
+      for (const cs of cachedSessions) {
+        if (!liveFileNames.has(cs.sessionId)) costUSD += cs.totalCostUSD;
+      }
       projects.push({ name: e.name, displayName, sessionCount: sessions.length, isActive, costUSD });
     }
     projects.sort((a, b) => b.sessionCount - a.sessionCount);
@@ -618,9 +624,12 @@ app.get('/api/sessions', async (req: Request, res: Response) => {
         if (existsSync(sessionSubDir)) sessionFiles.push(...await findJsonlFiles(sessionSubDir));
         const sessionUsage = await aggregateUsage(sessionFiles, 'all');
         const sessionCost = sessionUsage.totalCostUSD;
+        const startIso = start?.toISOString() || null;
+        const endIso = end?.toISOString() || null;
+        updateSessionCache(project, sessionId, sessionUsage, startIso, endIso);
         sessions.push({
           sessionId, isAgent, title,
-          startTime: start?.toISOString() || null, endTime: end?.toISOString() || null,
+          startTime: startIso, endTime: endIso,
           messageCount: main.length,
           toolCallCount: main.reduce((n, m) => n + (m.blocks || []).filter(b => b.type === 'tool_use').length, 0),
           thinkingBlockCount: main.reduce((n, m) => n + (m.blocks || []).filter(b => b.type === 'thinking').length, 0),
@@ -631,6 +640,23 @@ app.get('/api/sessions', async (req: Request, res: Response) => {
       } catch {
         sessions.push({ sessionId, isAgent, title: '(error)', startTime: fileStat.mtime.toISOString(), messageCount: 0, fileSize: fileStat.size, isActive: isSessionActive(sessionId, project), costUSD: 0 });
       }
+    }
+    // Append archived sessions from cache (JSONL no longer exists)
+    const liveIds = new Set(sessions.map(s => s.sessionId));
+    const cached = getCachedUsageForProject(project);
+    for (const entry of cached) {
+      if (liveIds.has(entry.sessionId)) continue;
+      sessions.push({
+        sessionId: entry.sessionId,
+        isAgent: entry.sessionId.startsWith('agent-'),
+        title: '(archived)',
+        startTime: entry.startTime,
+        endTime: entry.endTime,
+        messageCount: entry.messageCount,
+        fileSize: 0,
+        isActive: false,
+        costUSD: entry.totalCostUSD,
+      });
     }
     sessions.sort((a, b) => (b.endTime ? new Date(b.endTime).getTime() : 0) - (a.endTime ? new Date(a.endTime).getTime() : 0));
     res.json({ sessions });
@@ -851,6 +877,143 @@ async function aggregateUsage(files: string[], range: UsageRange): Promise<Usage
   return agg;
 }
 
+// ---------------------------------------------------------------------------
+// Usage persistence — survive session/project deletion
+// ---------------------------------------------------------------------------
+
+interface PersistedSessionUsage {
+  project: string;
+  sessionId: string;
+  startTime: string | null;
+  endTime: string | null;
+  totalCostUSD: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheCreationTokens: number;
+  totalCacheReadTokens: number;
+  messageCount: number;
+  models: Record<string, { cost: number; messages: number }>;
+  persistedAt: string;
+}
+
+interface PersistedUsageFile {
+  version: 1;
+  updatedAt: string;
+  sessions: Record<string, PersistedSessionUsage>;
+}
+
+const CACHE_DIR = join(homedir(), '.claude-context-inspector');
+const CACHE_FILE = join(CACHE_DIR, 'usage.json');
+
+let usageCache: PersistedUsageFile = { version: 1, updatedAt: new Date().toISOString(), sessions: {} };
+
+// Load cache once at startup (sync)
+function loadUsageCache(): void {
+  try {
+    if (existsSync(CACHE_FILE)) {
+      const raw = readFileSync(CACHE_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.version === 1 && parsed.sessions) {
+        usageCache = parsed as PersistedUsageFile;
+      }
+    }
+  } catch {
+    // Corrupt or missing — start fresh
+    usageCache = { version: 1, updatedAt: new Date().toISOString(), sessions: {} };
+  }
+}
+
+loadUsageCache();
+
+let savePending = false;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function saveUsageCache(): Promise<void> {
+  savePending = false;
+  try {
+    await mkdir(CACHE_DIR, { recursive: true });
+    usageCache.updatedAt = new Date().toISOString();
+    const tmp = CACHE_FILE + '.tmp';
+    await writeFile(tmp, JSON.stringify(usageCache, null, 2), 'utf-8');
+    await rename(tmp, CACHE_FILE);
+  } catch {
+    // Best-effort — don't crash on write failure
+  }
+}
+
+function scheduleSave(): void {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { saveUsageCache(); }, 1000);
+}
+
+function updateSessionCache(
+  project: string,
+  sessionId: string,
+  stats: Omit<UsageStatsResult, 'sessionCount'>,
+  startTime: string | null,
+  endTime: string | null,
+): void {
+  const key = `${project}/${sessionId}`;
+  usageCache.sessions[key] = {
+    project,
+    sessionId,
+    startTime,
+    endTime,
+    totalCostUSD: stats.totalCostUSD,
+    totalInputTokens: stats.totalInputTokens,
+    totalOutputTokens: stats.totalOutputTokens,
+    totalCacheCreationTokens: stats.totalCacheCreationTokens,
+    totalCacheReadTokens: stats.totalCacheReadTokens,
+    messageCount: stats.messageCount,
+    models: { ...stats.models },
+    persistedAt: new Date().toISOString(),
+  };
+  scheduleSave();
+}
+
+function getCachedSessionUsage(project: string, sessionId: string): PersistedSessionUsage | null {
+  return usageCache.sessions[`${project}/${sessionId}`] || null;
+}
+
+function getCachedUsageForProject(project: string): PersistedSessionUsage[] {
+  const prefix = `${project}/`;
+  return Object.entries(usageCache.sessions)
+    .filter(([key]) => key.startsWith(prefix))
+    .map(([, entry]) => entry);
+}
+
+function mergeModelMaps(
+  a: Record<string, { cost: number; messages: number }>,
+  b: Record<string, { cost: number; messages: number }>,
+): Record<string, { cost: number; messages: number }> {
+  const merged = { ...a };
+  for (const [model, data] of Object.entries(b)) {
+    if (!merged[model]) merged[model] = { cost: 0, messages: 0 };
+    merged[model].cost += data.cost;
+    merged[model].messages += data.messages;
+  }
+  return merged;
+}
+
+function aggregateCachedUsage(entries: PersistedSessionUsage[]): UsageStatsResult {
+  const result: UsageStatsResult = {
+    totalCostUSD: 0, totalInputTokens: 0, totalOutputTokens: 0,
+    totalCacheCreationTokens: 0, totalCacheReadTokens: 0,
+    messageCount: 0, sessionCount: 0, models: {},
+  };
+  for (const e of entries) {
+    result.totalCostUSD += e.totalCostUSD;
+    result.totalInputTokens += e.totalInputTokens;
+    result.totalOutputTokens += e.totalOutputTokens;
+    result.totalCacheCreationTokens += e.totalCacheCreationTokens;
+    result.totalCacheReadTokens += e.totalCacheReadTokens;
+    result.messageCount += e.messageCount;
+    if (e.messageCount > 0) result.sessionCount++;
+    result.models = mergeModelMaps(result.models, e.models);
+  }
+  return result;
+}
+
 app.get('/api/usage', async (req: Request, res: Response) => {
   try {
     const range = (req.query.range as UsageRange) || 'all';
@@ -862,12 +1025,30 @@ app.get('/api/usage', async (req: Request, res: Response) => {
 
     if (scope === 'session' && project && sessionId) {
       const filePath = join(PROJECTS_DIR, project, `${sessionId}.jsonl`);
-      if (!existsSync(filePath)) return res.json(emptyResult);
+      if (!existsSync(filePath)) {
+        // Fall back to cached data for deleted sessions
+        const cached = getCachedSessionUsage(project, sessionId);
+        if (cached) {
+          return res.json({
+            totalCostUSD: cached.totalCostUSD,
+            totalInputTokens: cached.totalInputTokens,
+            totalOutputTokens: cached.totalOutputTokens,
+            totalCacheCreationTokens: cached.totalCacheCreationTokens,
+            totalCacheReadTokens: cached.totalCacheReadTokens,
+            messageCount: cached.messageCount,
+            sessionCount: cached.messageCount > 0 ? 1 : 0,
+            models: cached.models,
+          } satisfies UsageStatsResult);
+        }
+        return res.json(emptyResult);
+      }
       // Include session file + its subagent files, with dedup
       const sessionDir = join(PROJECTS_DIR, project, sessionId);
       const files = [filePath];
       if (existsSync(sessionDir)) files.push(...await findJsonlFiles(sessionDir));
-      return res.json(await aggregateUsage(files, range));
+      const liveResult = await aggregateUsage(files, range);
+      updateSessionCache(project, sessionId, liveResult, null, null);
+      return res.json(liveResult);
     }
 
     let projectDirs: string[] = [];
@@ -886,7 +1067,42 @@ app.get('/api/usage', async (req: Request, res: Response) => {
       allFiles.push(...await findJsonlFiles(dir));
     }
 
-    res.json(await aggregateUsage(allFiles, range));
+    const liveResult = await aggregateUsage(allFiles, range);
+
+    // Merge cached sessions not covered by live files
+    const liveBasenames = new Set(allFiles.map(f => {
+      const parts = f.split('/');
+      const fileName = parts.pop()!.replace('.jsonl', '');
+      const projectName = parts[parts.indexOf('projects') + 1];
+      return `${projectName}/${fileName}`;
+    }));
+    const cutoff = getRangeCutoff(range);
+    const archivedEntries: PersistedSessionUsage[] = [];
+    const searchProjects = scope === 'project' && project ? [project] : projectDirs;
+    for (const pd of searchProjects) {
+      for (const entry of getCachedUsageForProject(pd)) {
+        const key = `${pd}/${entry.sessionId}`;
+        if (liveBasenames.has(key)) continue;
+        // Filter by time range: include if endTime >= cutoff (or no cutoff)
+        if (cutoff && entry.endTime) {
+          if (new Date(entry.endTime) < cutoff) continue;
+        }
+        archivedEntries.push(entry);
+      }
+    }
+    if (archivedEntries.length > 0) {
+      const cachedResult = aggregateCachedUsage(archivedEntries);
+      liveResult.totalCostUSD += cachedResult.totalCostUSD;
+      liveResult.totalInputTokens += cachedResult.totalInputTokens;
+      liveResult.totalOutputTokens += cachedResult.totalOutputTokens;
+      liveResult.totalCacheCreationTokens += cachedResult.totalCacheCreationTokens;
+      liveResult.totalCacheReadTokens += cachedResult.totalCacheReadTokens;
+      liveResult.messageCount += cachedResult.messageCount;
+      liveResult.sessionCount += cachedResult.sessionCount;
+      liveResult.models = mergeModelMaps(liveResult.models, cachedResult.models);
+    }
+
+    res.json(liveResult);
   } catch (err) { res.status(500).json({ error: (err as Error).message }); }
 });
 
