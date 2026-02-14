@@ -35,6 +35,21 @@ ccinspector
 # → http://localhost:3456
 ```
 
+## Daemon Mode
+
+Run the inspector as a background service instead of blocking your terminal:
+
+```bash
+ccinspector start            # start as background daemon
+ccinspector start -p 8080    # start on a custom port
+ccinspector status           # check if daemon is running
+ccinspector stop             # stop the daemon
+```
+
+Logs are written to `~/.claude-context-inspector/daemon.log`. The PID file is stored at `~/.claude-context-inspector/daemon.pid`.
+
+Running `ccinspector` with no arguments still starts in the foreground as before.
+
 ## Development
 
 ```bash
