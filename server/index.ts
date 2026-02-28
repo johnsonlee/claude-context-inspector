@@ -553,6 +553,100 @@ function computeContextHealth(messages: ParsedMessage[]): ContextHealth {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory caches — mtime-based invalidation avoids redundant file reads
+// ---------------------------------------------------------------------------
+
+interface CachedFileParse {
+  mtimeMs: number;
+  sizeBytes: number;
+  messages: ParsedMessage[];
+}
+
+const fileParseCache = new Map<string, CachedFileParse>();
+const MAX_FILE_CACHE_ENTRIES = 500;
+
+function evictOldestCacheEntries() {
+  if (fileParseCache.size <= MAX_FILE_CACHE_ENTRIES) return;
+  const excess = fileParseCache.size - MAX_FILE_CACHE_ENTRIES;
+  const iter = fileParseCache.keys();
+  for (let i = 0; i < excess; i++) {
+    const key = iter.next().value;
+    if (key) fileParseCache.delete(key);
+  }
+}
+
+async function getOrParseFile(filePath: string): Promise<CachedFileParse> {
+  const fileStat = await stat(filePath);
+  const cached = fileParseCache.get(filePath);
+  if (cached && cached.mtimeMs === fileStat.mtimeMs && cached.sizeBytes === fileStat.size) {
+    return cached;
+  }
+  const content = await readFile(filePath, 'utf-8');
+  const rawLines = content.trim().split('\n').map(parseLine).filter((x): x is RawEntry => x !== null);
+  const messages = parseTranscriptFull(rawLines);
+  const entry: CachedFileParse = { mtimeMs: fileStat.mtimeMs, sizeBytes: fileStat.size, messages };
+  fileParseCache.set(filePath, entry);
+  evictOldestCacheEntries();
+  return entry;
+}
+
+interface CachedSessionMeta {
+  mtimeMs: number;
+  sizeBytes: number;
+  sessionId: string;
+  isAgent: boolean;
+  title: string;
+  startTime: string | null;
+  endTime: string | null;
+  messageCount: number;
+  toolCallCount: number;
+  thinkingBlockCount: number;
+  summaryCount: number;
+  fileSize: number;
+  costUSD: number;
+}
+
+const sessionMetaCache = new Map<string, CachedSessionMeta>();
+
+async function getSessionMeta(filePath: string, projectDir: string, project: string): Promise<CachedSessionMeta> {
+  const fileStat = await stat(filePath);
+  const cached = sessionMetaCache.get(filePath);
+  if (cached && cached.mtimeMs === fileStat.mtimeMs && cached.sizeBytes === fileStat.size) {
+    return cached;
+  }
+  const { messages } = await getOrParseFile(filePath);
+  const file = filePath.split('/').pop()!;
+  const isAgent = file.startsWith('agent-');
+  const sessionId = file.replace('.jsonl', '');
+  const main = messages.filter(m => !m.isSidechain);
+  const firstUser = main.find(m => m.type === 'user' && m.blocks?.some(b => b.type === 'text'));
+  const title = (firstUser?.blocks?.find(b => b.type === 'text')?.text || '').slice(0, 140) || '(empty)';
+  const summaryCount = messages.filter(m => m.blocks?.some(b => b.type === 'summary')).length;
+  const ts = messages.filter(m => m.timestamp).map(m => new Date(m.timestamp!));
+  const start = ts.length ? new Date(Math.min(...ts.map(t => t.getTime()))) : null;
+  const end = ts.length ? new Date(Math.max(...ts.map(t => t.getTime()))) : null;
+  // Include subagent files for cost calculation with dedup
+  const sessionSubDir = join(projectDir, sessionId);
+  const sessionFiles = [filePath];
+  if (existsSync(sessionSubDir)) sessionFiles.push(...await findJsonlFiles(sessionSubDir));
+  const sessionUsage = await aggregateUsage(sessionFiles, 'all');
+  const startIso = start?.toISOString() || null;
+  const endIso = end?.toISOString() || null;
+  updateSessionCache(project, sessionId, sessionUsage, startIso, endIso);
+  const meta: CachedSessionMeta = {
+    mtimeMs: fileStat.mtimeMs, sizeBytes: fileStat.size,
+    sessionId, isAgent, title,
+    startTime: startIso, endTime: endIso,
+    messageCount: main.length,
+    toolCallCount: main.reduce((n, m) => n + (m.blocks || []).filter(b => b.type === 'tool_use').length, 0),
+    thinkingBlockCount: main.reduce((n, m) => n + (m.blocks || []).filter(b => b.type === 'thinking').length, 0),
+    summaryCount, fileSize: fileStat.size, costUSD: sessionUsage.totalCostUSD,
+  };
+  sessionMetaCache.set(filePath, meta);
+  return meta;
+}
+
+// ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 
@@ -561,26 +655,27 @@ app.get('/api/projects', async (_req: Request, res: Response) => {
     if (!existsSync(PROJECTS_DIR)) return res.json({ projects: [], error: `Not found: ${PROJECTS_DIR}` });
     const entries = await readdir(PROJECTS_DIR, { withFileTypes: true });
     refreshActiveState();
-    const projects: Array<{ name: string; displayName: string; sessionCount: number; isActive: boolean; costUSD: number }> = [];
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
+    const dirEntries = entries.filter(e => e.isDirectory());
+    const projects = await parallelMap(dirEntries, async (e) => {
       const projectDir = join(PROJECTS_DIR, e.name);
       const files = await readdir(projectDir);
       const sessions = files.filter(f => f.endsWith('.jsonl') && !f.startsWith('agent-'));
       const fullPath = '/' + e.name.replace(/^-+/, '').replaceAll('-', '/');
       const displayName = fullPath.startsWith(homedir()) ? '~' + fullPath.slice(homedir().length) : fullPath;
       const isActive = isProjectActive(e.name);
-      const allProjectFiles = await findJsonlFiles(projectDir);
-      const projectUsage = await aggregateUsage(allProjectFiles, 'all');
-      let costUSD = projectUsage.totalCostUSD;
-      // Add cached cost from deleted sessions
-      const liveFileNames = new Set(allProjectFiles.map(f => f.replace('.jsonl', '').split('/').pop()!));
+      // Use persisted usage cache as primary cost source
       const cachedSessions = getCachedUsageForProject(e.name);
-      for (const cs of cachedSessions) {
-        if (!liveFileNames.has(cs.sessionId)) costUSD += cs.totalCostUSD;
+      let costUSD: number;
+      if (cachedSessions.length > 0) {
+        costUSD = cachedSessions.reduce((sum, cs) => sum + cs.totalCostUSD, 0);
+      } else {
+        // Fallback: read files only when no cache exists yet
+        const allProjectFiles = await findJsonlFiles(projectDir);
+        const projectUsage = await aggregateUsage(allProjectFiles, 'all');
+        costUSD = projectUsage.totalCostUSD;
       }
-      projects.push({ name: e.name, displayName, sessionCount: sessions.length, isActive, costUSD });
-    }
+      return { name: e.name, displayName, sessionCount: sessions.length, isActive, costUSD };
+    }, 10);
     projects.sort((a, b) => b.sessionCount - a.sessionCount);
     res.json({ projects });
   } catch (err) { res.status(500).json({ error: (err as Error).message }); }
@@ -595,52 +690,32 @@ app.get('/api/sessions', async (req: Request, res: Response) => {
     const files = await readdir(projectDir);
     const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
     refreshActiveState();
-    const sessions: Array<{
-      sessionId: string; isAgent: boolean; title: string;
-      startTime: string | null; endTime?: string | null;
-      messageCount: number; toolCallCount?: number;
-      thinkingBlockCount?: number; summaryCount?: number; fileSize: number;
-      isActive: boolean; costUSD: number;
-    }> = [];
-    for (const file of jsonlFiles) {
+    // Parallel session metadata extraction with caching
+    const sessions = await parallelMap(jsonlFiles, async (file) => {
       const filePath = join(projectDir, file);
-      const fileStat = await stat(filePath);
-      const isAgent = file.startsWith('agent-');
-      const sessionId = file.replace('.jsonl', '');
       try {
-        const content = await readFile(filePath, 'utf-8');
-        const rawLines = content.trim().split('\n').map(parseLine).filter((x): x is RawEntry => x !== null);
-        const messages = parseTranscriptFull(rawLines);
-        const main = messages.filter(m => !m.isSidechain);
-        const firstUser = main.find(m => m.type === 'user' && m.blocks?.some(b => b.type === 'text'));
-        const title = (firstUser?.blocks?.find(b => b.type === 'text')?.text || '').slice(0, 140) || '(empty)';
-        const summaryCount = messages.filter(m => m.blocks?.some(b => b.type === 'summary')).length;
-        const ts = messages.filter(m => m.timestamp).map(m => new Date(m.timestamp!));
-        const start = ts.length ? new Date(Math.min(...ts.map(t => t.getTime()))) : null;
-        const end = ts.length ? new Date(Math.max(...ts.map(t => t.getTime()))) : null;
-        // Include subagent files for cost calculation with dedup
-        const sessionSubDir = join(projectDir, sessionId);
-        const sessionFiles = [filePath];
-        if (existsSync(sessionSubDir)) sessionFiles.push(...await findJsonlFiles(sessionSubDir));
-        const sessionUsage = await aggregateUsage(sessionFiles, 'all');
-        const sessionCost = sessionUsage.totalCostUSD;
-        const startIso = start?.toISOString() || null;
-        const endIso = end?.toISOString() || null;
-        updateSessionCache(project, sessionId, sessionUsage, startIso, endIso);
-        sessions.push({
-          sessionId, isAgent, title,
-          startTime: startIso, endTime: endIso,
-          messageCount: main.length,
-          toolCallCount: main.reduce((n, m) => n + (m.blocks || []).filter(b => b.type === 'tool_use').length, 0),
-          thinkingBlockCount: main.reduce((n, m) => n + (m.blocks || []).filter(b => b.type === 'thinking').length, 0),
-          summaryCount, fileSize: fileStat.size,
-          isActive: isSessionActive(sessionId, project),
-          costUSD: sessionCost,
-        });
+        const meta = await getSessionMeta(filePath, projectDir, project);
+        return {
+          sessionId: meta.sessionId, isAgent: meta.isAgent, title: meta.title,
+          startTime: meta.startTime, endTime: meta.endTime,
+          messageCount: meta.messageCount, toolCallCount: meta.toolCallCount,
+          thinkingBlockCount: meta.thinkingBlockCount, summaryCount: meta.summaryCount,
+          fileSize: meta.fileSize,
+          isActive: isSessionActive(meta.sessionId, project),
+          costUSD: meta.costUSD,
+        };
       } catch {
-        sessions.push({ sessionId, isAgent, title: '(error)', startTime: fileStat.mtime.toISOString(), messageCount: 0, fileSize: fileStat.size, isActive: isSessionActive(sessionId, project), costUSD: 0 });
+        const fileStat = await stat(filePath);
+        const sessionId = file.replace('.jsonl', '');
+        return {
+          sessionId, isAgent: file.startsWith('agent-'),
+          title: '(error)', startTime: fileStat.mtime.toISOString(), endTime: null as string | null,
+          messageCount: 0, toolCallCount: 0, thinkingBlockCount: 0, summaryCount: 0,
+          fileSize: fileStat.size,
+          isActive: isSessionActive(sessionId, project), costUSD: 0,
+        };
       }
-    }
+    }, 10);
     // Append archived sessions from cache (JSONL no longer exists)
     const liveIds = new Set(sessions.map(s => s.sessionId));
     const cached = getCachedUsageForProject(project);
@@ -653,6 +728,7 @@ app.get('/api/sessions', async (req: Request, res: Response) => {
         startTime: entry.startTime,
         endTime: entry.endTime,
         messageCount: entry.messageCount,
+        toolCallCount: 0, thinkingBlockCount: 0, summaryCount: 0,
         fileSize: 0,
         isActive: false,
         costUSD: entry.totalCostUSD,
@@ -668,9 +744,7 @@ app.get('/api/session/:project/:sessionId', async (req: Request<{ project: strin
     const { project, sessionId } = req.params;
     const filePath = join(PROJECTS_DIR, project, `${sessionId}.jsonl`);
     if (!existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
-    const content = await readFile(filePath, 'utf-8');
-    const rawLines = content.trim().split('\n').map(parseLine).filter((x): x is RawEntry => x !== null);
-    const messages = parseTranscriptFull(rawLines);
+    const { messages } = await getOrParseFile(filePath);
     const mainMessages = messages.filter(m => !m.isSidechain);
     const composition = computeContextComposition(mainMessages);
     const contextHealth = computeContextHealth(mainMessages);
@@ -830,23 +904,36 @@ function computeUsageStats(messages: ParsedMessage[], range: UsageRange, seenHas
   return result;
 }
 
-// Recursively find all .jsonl files under a directory
-async function findJsonlFiles(dir: string): Promise<string[]> {
-  const results: string[] = [];
-  let entries;
-  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return results; }
-  for (const e of entries) {
-    const full = join(dir, e.name);
-    if (e.isDirectory()) {
-      results.push(...await findJsonlFiles(full));
-    } else if (e.name.endsWith('.jsonl')) {
-      results.push(full);
+// ---------------------------------------------------------------------------
+// Parallel utilities
+// ---------------------------------------------------------------------------
+
+async function parallelMap<T, R>(items: T[], fn: (item: T) => Promise<R>, concurrency: number): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i]);
     }
-  }
+  });
+  await Promise.all(workers);
   return results;
 }
 
-// Aggregate usage from a set of .jsonl files with dedup
+// Recursively find all .jsonl files under a directory (parallel subdirs)
+async function findJsonlFiles(dir: string): Promise<string[]> {
+  let entries;
+  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return []; }
+  const files = entries.filter(e => !e.isDirectory() && e.name.endsWith('.jsonl')).map(e => join(dir, e.name));
+  const subdirResults = await Promise.all(
+    entries.filter(e => e.isDirectory()).map(e => findJsonlFiles(join(dir, e.name)))
+  );
+  for (const sub of subdirResults) files.push(...sub);
+  return files;
+}
+
+// Aggregate usage from a set of .jsonl files with dedup (cached + parallel reads)
 async function aggregateUsage(files: string[], range: UsageRange): Promise<UsageStatsResult> {
   const seenHashes = new Set<string>();
   const agg: UsageStatsResult = {
@@ -854,25 +941,28 @@ async function aggregateUsage(files: string[], range: UsageRange): Promise<Usage
     totalCacheCreationTokens: 0, totalCacheReadTokens: 0,
     messageCount: 0, sessionCount: 0, models: {},
   };
-  for (const file of files) {
+  // Parallel reads with cache — then sequential dedup
+  const allMessages = await parallelMap(files, async (file) => {
     try {
-      const content = await readFile(file, 'utf-8');
-      const rawLines = content.trim().split('\n').map(parseLine).filter((x): x is RawEntry => x !== null);
-      const messages = parseTranscriptFull(rawLines);
-      const stats = computeUsageStats(messages, range, seenHashes);
-      agg.totalCostUSD += stats.totalCostUSD;
-      agg.totalInputTokens += stats.totalInputTokens;
-      agg.totalOutputTokens += stats.totalOutputTokens;
-      agg.totalCacheCreationTokens += stats.totalCacheCreationTokens;
-      agg.totalCacheReadTokens += stats.totalCacheReadTokens;
-      agg.messageCount += stats.messageCount;
-      if (stats.messageCount > 0) agg.sessionCount++;
-      for (const [model, data] of Object.entries(stats.models)) {
-        if (!agg.models[model]) agg.models[model] = { cost: 0, messages: 0 };
-        agg.models[model].cost += data.cost;
-        agg.models[model].messages += data.messages;
-      }
-    } catch { /* skip unreadable files */ }
+      const { messages } = await getOrParseFile(file);
+      return messages;
+    } catch { return null; }
+  }, 10);
+  for (const messages of allMessages) {
+    if (!messages) continue;
+    const stats = computeUsageStats(messages, range, seenHashes);
+    agg.totalCostUSD += stats.totalCostUSD;
+    agg.totalInputTokens += stats.totalInputTokens;
+    agg.totalOutputTokens += stats.totalOutputTokens;
+    agg.totalCacheCreationTokens += stats.totalCacheCreationTokens;
+    agg.totalCacheReadTokens += stats.totalCacheReadTokens;
+    agg.messageCount += stats.messageCount;
+    if (stats.messageCount > 0) agg.sessionCount++;
+    for (const [model, data] of Object.entries(stats.models)) {
+      if (!agg.models[model]) agg.models[model] = { cost: 0, messages: 0 };
+      agg.models[model].cost += data.cost;
+      agg.models[model].messages += data.messages;
+    }
   }
   return agg;
 }
@@ -1132,7 +1222,15 @@ function broadcast(event: string, data: unknown) {
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingPaths = new Set<string>();
 
+function invalidateCachesForPath(path: string) {
+  if (path.endsWith('.jsonl')) {
+    fileParseCache.delete(path);
+    sessionMetaCache.delete(path);
+  }
+}
+
 function onFsChange(path: string) {
+  invalidateCachesForPath(path);
   pendingPaths.add(path);
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
@@ -1142,12 +1240,17 @@ function onFsChange(path: string) {
   }, 500);
 }
 
+function onFsUnlink(path: string) {
+  invalidateCachesForPath(path);
+  onFsChange(path);
+}
+
 if (existsSync(PROJECTS_DIR)) {
   chokidar
     .watch(PROJECTS_DIR, { ignoreInitial: true, depth: 2 })
     .on('add', onFsChange)
     .on('change', onFsChange)
-    .on('unlink', onFsChange);
+    .on('unlink', onFsUnlink);
 }
 
 // ---------------------------------------------------------------------------

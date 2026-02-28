@@ -11,8 +11,16 @@ const RANGES: { label: string; value: UsageRange }[] = [
   { label: 'ALL', value: 'all' },
 ];
 
+const SHORT_TO_RANGE: Record<string, UsageRange> = { d: 'day', w: 'week', m: 'month', y: 'year' };
+const RANGE_TO_SHORT: Record<string, string> = { day: 'd', week: 'w', month: 'm', year: 'y' };
+
+function getInitialRange(): UsageRange {
+  const param = new URLSearchParams(window.location.search).get('range')?.toLowerCase();
+  return param && SHORT_TO_RANGE[param] ? SHORT_TO_RANGE[param] : 'all';
+}
+
 export default function UsagePanel() {
-  const [range, setRange] = useState<UsageRange>('all');
+  const [range, setRange] = useState<UsageRange>(getInitialRange);
   const [stats, setStats] = useState<UsageStats | null>(null);
   const [stale, setStale] = useState(false);
   const reqId = useRef(0);
@@ -34,7 +42,13 @@ export default function UsagePanel() {
             <button
               key={r.value}
               className={'usage-range' + (range === r.value ? ' on' : '')}
-              onClick={() => setRange(r.value)}
+              onClick={() => {
+                setRange(r.value);
+                const params = new URLSearchParams(window.location.search);
+                if (r.value === 'all') params.delete('range'); else params.set('range', RANGE_TO_SHORT[r.value]);
+                const qs = params.toString();
+                window.history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname);
+              }}
             >
               {r.label}
             </button>
