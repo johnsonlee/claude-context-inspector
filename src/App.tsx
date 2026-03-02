@@ -8,6 +8,15 @@ import UsagePanel from './components/UsagePanel';
 import SessionsListPage from './components/SessionsListPage';
 import SessionPage from './components/SessionPage';
 
+function parseHash(hash: string): { projectName: string; sessionId?: string } | null {
+  const s = hash.startsWith('#') ? hash.slice(1) : hash;
+  const projectMatch = /^\/project\/([^/]+)(?:\/session\/([^/]+))?$/.exec(s);
+  if (!projectMatch) return null;
+  const projectName = decodeURIComponent(projectMatch[1]);
+  const sessionId = projectMatch[2] ? decodeURIComponent(projectMatch[2]) : undefined;
+  return { projectName, sessionId };
+}
+
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [view, setView] = useState<View>({ page: 'projects' });
@@ -18,6 +27,70 @@ export default function App() {
 
   useEffect(() => { refreshProjects(); }, []);
   useLiveReload(refreshProjects);
+
+  // --- Hash-based navigation state sync ---
+  const initialHashProcessed = useRef(false);
+
+  // Restore view from URL hash when projects first load
+  useEffect(() => {
+    if (initialHashProcessed.current || projects.length === 0) return;
+    initialHashProcessed.current = true;
+
+    const parsed = parseHash(window.location.hash);
+    if (!parsed) return;
+
+    const project = projects.find(p => p.name === parsed.projectName);
+    if (!project) return;
+
+    if (parsed.sessionId) {
+      setView({ page: 'session', project, sessionId: parsed.sessionId });
+    } else {
+      setView({ page: 'sessions', project });
+    }
+  }, [projects]);
+
+  // Update URL hash when view changes
+  useEffect(() => {
+    if (!initialHashProcessed.current) return;
+
+    let hash = '#/';
+    if (view.page === 'sessions' && view.project) {
+      hash = `#/project/${encodeURIComponent(view.project.name)}`;
+    } else if (view.page === 'session' && view.project && view.sessionId) {
+      hash = `#/project/${encodeURIComponent(view.project.name)}/session/${encodeURIComponent(view.sessionId)}`;
+    }
+
+    if (window.location.hash !== hash) {
+      window.history.pushState(null, '', hash);
+    }
+  }, [view]);
+
+  // Handle browser back/forward navigation
+  useEffect(() => {
+    const onPopState = () => {
+      const parsed = parseHash(window.location.hash);
+      if (!parsed) {
+        setView({ page: 'projects' });
+        return;
+      }
+
+      const project = projects.find(p => p.name === parsed.projectName);
+      if (!project) {
+        setView({ page: 'projects' });
+        return;
+      }
+
+      if (parsed.sessionId) {
+        setView({ page: 'session', project, sessionId: parsed.sessionId });
+      } else {
+        setView({ page: 'sessions', project });
+      }
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [projects]);
+  // --- End hash-based navigation state sync ---
 
   const activeProject = view.project?.name;
 
