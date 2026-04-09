@@ -1,6 +1,6 @@
 {
   "name": "claude-context-inspector",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Web UI for visualizing Claude Code context window usage, cost tracking, and session comparison",
   "type": "module",
   "bin": {
