@@ -734,7 +734,11 @@ app.get('/api/sessions', async (req: Request, res: Response) => {
         costUSD: entry.totalCostUSD,
       });
     }
-    sessions.sort((a, b) => (b.endTime ? new Date(b.endTime).getTime() : 0) - (a.endTime ? new Date(a.endTime).getTime() : 0));
+    sessions.sort((a, b) => {
+      const ta = new Date(a.endTime || a.startTime).getTime();
+      const tb = new Date(b.endTime || b.startTime).getTime();
+      return tb - ta;
+    });
     res.json({ sessions });
   } catch (err) { res.status(500).json({ error: (err as Error).message }); }
 });
